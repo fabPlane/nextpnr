@@ -1089,7 +1089,12 @@ def create_extra_funcs(tt: TileType, db: chipdb, x: int, y: int):
                 bel = tt.create_bel("PINCFG", "PINCFG", PINCFG_Z)
                 portmap = desc['ins']
                 for port, wire in portmap.items():
-                    create_reuse_wire(tt, wire, "PINCFG_IN")
+                    # Some configuration inputs are hard-wired constants rather
+                    # than switch-matrix wires. Mark those local wires as
+                    # constant sources so the router need not reach them from
+                    # the device-wide GND/VCC generator.
+                    const_value = wire if wire in {'VSS', 'VCC'} else ''
+                    create_reuse_wire(tt, wire, "PINCFG_IN", const_value)
                     tt.add_bel_pin(bel, port, wire, PinType.INPUT)
         elif func == 'pll':
                 pll = tt.create_bel("PLL", "PLLA", z = PLL_Z)
