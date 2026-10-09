@@ -72,6 +72,32 @@ struct GowinGlobalRouter
         src = ctx->getPipSrcWire(pip);
         dst = ctx->getPipDstWire(pip);
         IdString dst_name = ctx->getWireName(dst)[1];
+        IdString src_name = ctx->getWireName(src)[1];
+        // The vendor HDMI bitstream enters this HCLK tile on CLK0 from GB00.
+        // Other lanes and the neighboring GB segments are a different column.
+        std::string dst_full = ctx->getWireName(dst).str(ctx);
+        std::string src_local = src_name.str(ctx);
+        if (dst_full.find("X181Y81/CLK") != std::string::npos &&
+            dst_full.find("X181Y81/CLK0") == std::string::npos)
+            return false;
+        if (dst_full.find("X181Y81/CLK0") != std::string::npos && src_local != "GB00")
+            return false;
+        // SPINE24-27 have a one-bit PLL tap and reach the HDMI column.
+        // SPINE28 and above still have no fused tap onto GT00 there.
+        auto dst_spine = dst_name.str(ctx);
+        if (dst_spine.rfind("SPINE", 0) == 0) {
+            int spine_n = 0;
+            bool digits = true;
+            for (char ch : dst_spine.substr(5)) {
+                if (ch < '0' || ch > '9') {
+                    digits = false;
+                    break;
+                }
+                spine_n = spine_n * 10 + (ch - '0');
+            }
+            if (digits && spine_n >= 28)
+                return false;
+        }
         bool not_dcs_pip = dst_name != id_CLKOUT;
         IdString src_type = ctx->getWireType(src);
         IdString dst_type = ctx->getWireType(dst);
@@ -84,7 +110,17 @@ struct GowinGlobalRouter
             bool dst_is_spine = dst_name.str(ctx).rfind("SPINE", 0) == 0;
             res = src_valid && (dst_is_spine || dst_type == id_PLL_O);
         } else {
-            res = (src_valid && dst_valid) || (src_valid && is_local(dst_type)) || (is_local(src_type) && dst_valid);
+            // Local wires are only followed for the GB/GT clock branch. Allowing
+            // every local wire makes the search explode before it reaches a spine
+            // on the far side of the chip.
+            auto is_branch = [&](IdString name) {
+                auto s = name.str(ctx);
+                return s.rfind("GB", 0) == 0 || s.rfind("GT", 0) == 0;
+            };
+            bool src_branch = is_branch(ctx->getWireName(src)[1]);
+            bool dst_branch = is_branch(dst_name);
+            res = (src_valid && dst_valid) || (src_valid && is_local(dst_type) && dst_branch) ||
+                  (is_local(src_type) && dst_valid && src_branch);
         }
         if (ctx->debug && false /*&& res*/) {
             log_info("%s <- %s [%s <- %s]\n", ctx->nameOfWire(ctx->getPipDstWire(pip)),
@@ -182,6 +218,7 @@ struct GowinGlobalRouter
 
         visit.push(dst);
         backtrace[dst] = PipId();
+        WireId join = WireId();
 
         int iter = 0;
 
@@ -213,6 +250,14 @@ struct GowinGlobalRouter
                 backtrace[prev] = pip;
                 // Check if we are done yet
                 if (prev == src) {
+                    join = src;
+                    goto done;
+                }
+                // A sink across the chip can join the global spine a nearer
+                // sink has already claimed, instead of walking the whole
+                // fabric back to the PLL pin.
+                if (ctx->getBoundWireNet(prev) == net && ctx->getWireType(prev) == id_GLOBAL_CLK) {
+                    join = prev;
                     goto done;
                 }
             }
@@ -222,8 +267,8 @@ struct GowinGlobalRouter
             }
         }
 
-        if (backtrace.count(src)) {
-            WireId cursor = src;
+        if (join != WireId()) {
+            WireId cursor = join;
             std::vector<PipId> pips;
             // Create a list of pips on the routed path
             while (true) {
@@ -283,6 +328,7 @@ struct GowinGlobalRouter
         }
 
         RouteResult routed = NOT_ROUTED;
+        std::vector<PortRef> retry;
         for (auto usr : net->users) {
             WireId dst = ctx->getNetinfoSinkWire(net, usr, 0);
             if (dst == WireId()) {
@@ -296,8 +342,25 @@ struct GowinGlobalRouter
             if (bfs_res) {
                 routed = routed == ROUTED_PARTIALLY ? routed : ROUTED_ALL;
             } else {
+                retry.push_back(usr);
                 routed = routed == NOT_ROUTED ? routed : ROUTED_PARTIALLY;
             }
+        }
+        // The first pass leaves the PLL and the near spine bound. Sinks that
+        // could not reach the PLL pin can now join that spine.
+        if (!retry.empty() && routed != NOT_ROUTED) {
+            bool still_failed = false;
+            for (auto usr : retry) {
+                WireId dst = ctx->getNetinfoSinkWire(net, usr, 0);
+                bool bfs_res = backwards_bfs_route(
+                        net, src, dst, 1000000, false,
+                        [&](PipId pip, WireId src_wire) { return (is_relaxed_sink(usr) || pip_filter(pip, src)); },
+                        path);
+                if (!bfs_res) {
+                    still_failed = true;
+                }
+            }
+            routed = still_failed ? ROUTED_PARTIALLY : ROUTED_ALL;
         }
         if (routed == NOT_ROUTED) {
             if (aux_src == WireId()) {

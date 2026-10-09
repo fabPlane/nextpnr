@@ -1089,7 +1089,12 @@ def create_extra_funcs(tt: TileType, db: chipdb, x: int, y: int):
                 bel = tt.create_bel("PINCFG", "PINCFG", PINCFG_Z)
                 portmap = desc['ins']
                 for port, wire in portmap.items():
-                    create_reuse_wire(tt, wire, "PINCFG_IN")
+                    # Some configuration inputs are hard-wired constants rather
+                    # than switch-matrix wires. Mark those local wires as
+                    # constant sources so the router need not reach them from
+                    # the device-wide GND/VCC generator.
+                    const_value = wire if wire in {'VSS', 'VCC'} else ''
+                    create_reuse_wire(tt, wire, "PINCFG_IN", const_value)
                     tt.add_bel_pin(bel, port, wire, PinType.INPUT)
         elif func == 'pll':
                 pll = tt.create_bel("PLL", "PLLA", z = PLL_Z)
@@ -1341,6 +1346,11 @@ def create_logic_tiletype(chip: Chip, db: chipdb, x: int, y: int, ttyp: int, tde
             tt.add_bel_pin(lut, f"I{j}", f"{inp_name}{i}", PinType.INPUT)
         tt.add_bel_pin(lut, "F", f"F{i}", PinType.OUTPUT)
         if i < 6 or "HAS_DFF67" in db.chip_flags:
+            # GW5AST Q0 has no fused mux onto a long wire (only Q0→D0). A flop
+            # placed on DFF0 cannot drive a net that leaves the slice, and the
+            # router then fails or emits an unfused hop. LUT0 stays.
+            if i == 0 and chip.name == 'GW5AST-138C':
+                continue
             tt.create_pip(f"F{i}", f"XD{i}", get_tm_class(db, f"F{i}"))
             # also experimental input for FF using SEL wire - this theory will
             # allow to place unrelated LUT and FF next to each other

@@ -268,6 +268,13 @@ void GowinImpl::init(Context *ctx)
 // We do not allow the use of global wires that bypass a special router.
 bool GowinImpl::checkPipAvail(PipId pip) const
 {
+    // L2HCLK33 is the LSR2 reset pin. L2HCLK31 has no fused driver.
+    // L2HCLK32 is the neighboring lane; the vendor HDMI clock is L2HCLK30.
+    const std::string pip_name = ctx->getPipName(pip).str(ctx);
+    if (pip_name.find("L2HCLK33") != std::string::npos ||
+        pip_name.find("L2HCLK31") != std::string::npos ||
+        pip_name.find("L2HCLK32") != std::string::npos)
+        return false;
     return (ctx->getWireConstantValue(ctx->getPipSrcWire(pip)) != IdString()) ||
            (!(gwu.is_global_pip(pip) || gwu.is_segment_pip(pip)));
 }
